@@ -4,37 +4,175 @@ Semantic search interface for querying courses using word2vec.
 
 import json
 import re
-from typing import List, Dict, Tuple
+import os
+from typing import List, Dict, Tuple, Optional
 import numpy as np
 from gensim.models import Word2Vec
 import logging
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Import MongoDB storage (optional dependency)
+try:
+    from .mongodb_storage import MongoDBStorage
+    MONGODB_AVAILABLE = True
+except ImportError:
+    MONGODB_AVAILABLE = False
+    logger.warning("MongoDB storage not available. Install pymongo to use MongoDB features.")
+
 
 class SemanticSearch:
-    def __init__(self, model_path: str = 'word2vec_model.model', 
-                 courses_path: str = 'courses.json'):
+    def __init__(self, 
+                 model_path: Optional[str] = 'word2vec_model.model', 
+                 courses_path: str = 'courses.json',
+                 use_mongodb: bool = False,
+                 mongodb_uri: Optional[str] = None,
+                 mongodb_db: str = 'course_search',
+                 mongodb_collection: str = 'courses',
+                 use_cosine_aggregation: bool = False):
         """
         Initialize semantic search with word2vec model and course data.
         
         Args:
-            model_path: Path to trained word2vec model
+            model_path: Path to trained word2vec model (optional if use_mongodb=True)
             courses_path: Path to courses JSON file
+            use_mongodb: If True, use MongoDB for vector search
+            mongodb_uri: MongoDB connection string (optional, uses env var)
+            mongodb_db: MongoDB database name
+            mongodb_collection: MongoDB collection name
+            use_cosine_aggregation: If True, use MongoDB aggregation for cosine similarity
+                                   instead of Atlas vector search (default: False)
         """
-        # Load model
-        self.model = Word2Vec.load(model_path)
-        logger.info(f"Loaded word2vec model from {model_path}")
+        self.use_mongodb = use_mongodb and MONGODB_AVAILABLE
+        self.use_cosine_aggregation = use_cosine_aggregation
+        self.model_path = model_path
+        self.model = None  # Lazy-loaded when needed
         
-        # Load courses
-        with open(courses_path, 'r', encoding='utf-8') as f:
-            self.courses = json.load(f)
-        logger.info(f"Loaded {len(self.courses)} courses")
+        # Initialize MongoDB if requested
+        self.mongodb_storage = None
+        mongodb_connection_successful = False
+        if self.use_mongodb:
+            try:
+                # Use provided values or fall back to environment variables
+                db_name = mongodb_db or os.getenv('MONGODB_DATABASE', 'course_search')
+                coll_name = mongodb_collection or os.getenv('MONGODB_COLLECTION', 'courses')
+                
+                self.mongodb_storage = MongoDBStorage(
+                    connection_string=mongodb_uri,
+                    database_name=db_name,
+                    collection_name=coll_name
+                )
+                if self.mongodb_storage.connect():
+                    mongodb_connection_successful = True
+                    search_method = ("cosine similarity aggregation" if
+                                     use_cosine_aggregation else
+                                     "Atlas vector search")
+                    logger.info(
+                        f"Using MongoDB for vector search ({search_method})"
+                    )
+                    
+                    # Check if word vectors are stored in MongoDB
+                    if self.mongodb_storage.has_word_vectors():
+                        logger.info(
+                            "Word vectors found in MongoDB. Model file not "
+                            "required for query vector generation."
+                        )
+                        # Model path is optional when word vectors are in MongoDB
+                    elif model_path and os.path.exists(model_path):
+                        logger.info(
+                            "Word vectors not found in MongoDB. Model file "
+                            "will be used for query vector generation. "
+                            "Consider running --populate-mongodb to store "
+                            "word vectors in MongoDB."
+                        )
+                    else:
+                        logger.warning(
+                            "Word vectors not found in MongoDB and model file "
+                            "not found. Query vector generation will fail. "
+                            "Either:\n"
+                            "  1. Run --populate-mongodb to store word vectors, or\n"
+                            "  2. Provide a valid model_path"
+                        )
+                else:
+                    logger.warning("MongoDB connection failed, falling back to local model")
+                    self.use_mongodb = False
+            except Exception as e:
+                logger.warning(f"MongoDB initialization failed: {e}, falling back to local model")
+                self.use_mongodb = False
         
-        # Precompute course vectors
-        self.course_vectors = {}
-        self._precompute_course_vectors()
+        # Load model if not using MongoDB (required for local search)
+        if not self.use_mongodb:
+            # Check if model is available
+            if not model_path:
+                if mongodb_connection_successful:
+                    # MongoDB was requested and connected, but then disabled
+                    raise ValueError(
+                        "MongoDB connection was successful but then disabled. "
+                        "This is unexpected. Please check your MongoDB "
+                        "configuration."
+                    )
+                else:
+                    raise ValueError(
+                        "model_path is required when not using MongoDB. "
+                        "Either provide a model_path or ensure MongoDB "
+                        "connection succeeds."
+                    )
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(
+                    f"Model file not found: {model_path}. "
+                    "Please run with --train first, or ensure MongoDB "
+                    "connection succeeds."
+                )
+            self.model = Word2Vec.load(model_path)
+            logger.info(f"Loaded word2vec model from {model_path}")
+        
+        # Load courses (for local search or fallback)
+        try:
+            with open(courses_path, 'r', encoding='utf-8') as f:
+                self.courses = json.load(f)
+            logger.info(f"Loaded {len(self.courses)} courses from {courses_path}")
+        except FileNotFoundError:
+            logger.warning(f"Courses file not found: {courses_path}")
+            self.courses = []
+        
+        # Precompute course vectors (only for local search)
+        if not self.use_mongodb:
+            self.course_vectors = {}
+            self._precompute_course_vectors()
+        else:
+            self.course_vectors = {}
+            logger.info("Skipping local vector precomputation (using MongoDB)")
+    
+    def _ensure_model_loaded(self):
+        """Lazy-load the model when needed for query vector generation."""
+        # If MongoDB has word vectors, we don't need the local model
+        if (self.use_mongodb and self.mongodb_storage and
+                self.mongodb_storage.has_word_vectors()):
+            return
+        
+        if self.model is None:
+            if not self.model_path:
+                error_msg = (
+                    "Model path required for query vector generation. "
+                    "Either provide a model_path or ensure word vectors are "
+                    "stored in MongoDB (run --populate-mongodb)."
+                )
+                raise ValueError(error_msg)
+            if not os.path.exists(self.model_path):
+                error_msg = (
+                    f"Model file not found: {self.model_path}. "
+                    "Required for generating query vectors. "
+                    "Either provide a valid model file or ensure word vectors "
+                    "are stored in MongoDB (run --populate-mongodb)."
+                )
+                raise FileNotFoundError(error_msg)
+            self.model = Word2Vec.load(self.model_path)
+            logger.info(f"Loaded word2vec model from {self.model_path}")
     
     def _get_text_tokens(self, text: str) -> List[str]:
         """Extract tokens from text (simple tokenization for query)."""
@@ -50,7 +188,18 @@ class SemanticSearch:
         # Simple tokenization
         tokens = text.split()
         
-        # Filter tokens that exist in model vocabulary
+        # If using MongoDB and word vectors are available, check vocabulary there
+        if (self.use_mongodb and self.mongodb_storage and
+                self.mongodb_storage.has_word_vectors()):
+            # Filter tokens that exist in MongoDB vocabulary
+            valid_tokens = []
+            for token in tokens:
+                if self.mongodb_storage.get_word_vector(token) is not None:
+                    valid_tokens.append(token)
+            return valid_tokens
+        
+        # Otherwise, use local model
+        self._ensure_model_loaded()
         valid_tokens = [t for t in tokens if t in self.model.wv.key_to_index]
         
         return valid_tokens
@@ -68,11 +217,45 @@ class SemanticSearch:
         tokens = self._get_text_tokens(text)
         
         if not tokens:
-            # Return zero vector if no valid tokens
-            return np.zeros(self.model.wv.vector_size)
+            # Determine vector size
+            vector_size = None
+            
+            # Try to get from MongoDB first
+            if (self.use_mongodb and self.mongodb_storage and
+                    self.mongodb_storage.has_word_vectors()):
+                vector_size = self.mongodb_storage.get_vector_size()
+            
+            # Fallback to local model
+            if vector_size is None:
+                self._ensure_model_loaded()
+                vector_size = self.model.wv.vector_size
+            
+            return np.zeros(vector_size)
         
         # Get vectors for each token
-        vectors = [self.model.wv[token] for token in tokens]
+        vectors = []
+        
+        # Try MongoDB first if available
+        if (self.use_mongodb and self.mongodb_storage and
+                self.mongodb_storage.has_word_vectors()):
+            word_vectors = self.mongodb_storage.get_word_vectors_batch(tokens)
+            vectors = [word_vectors[token] for token in tokens
+                      if token in word_vectors]
+        else:
+            # Fallback to local model
+            self._ensure_model_loaded()
+            vectors = [self.model.wv[token] for token in tokens]
+        
+        if not vectors:
+            # Return zero vector if no valid vectors found
+            vector_size = None
+            if (self.use_mongodb and self.mongodb_storage and
+                    self.mongodb_storage.has_word_vectors()):
+                vector_size = self.mongodb_storage.get_vector_size()
+            if vector_size is None:
+                self._ensure_model_loaded()
+                vector_size = self.model.wv.vector_size
+            return np.zeros(vector_size)
         
         # Average the vectors
         avg_vector = np.mean(vectors, axis=0)
@@ -147,10 +330,29 @@ class SemanticSearch:
             logger.warning(f"No valid tokens found in query: '{query}'")
             return []
         
+        # Use MongoDB if enabled
+        if self.use_mongodb and self.mongodb_storage:
+            try:
+                return self.mongodb_storage.vector_search(
+                    query_vector, 
+                    top_k=top_k,
+                    use_cosine_aggregation=self.use_cosine_aggregation
+                )
+            except Exception as e:
+                logger.error(f"MongoDB search failed: {e}, falling back to local")
+                # Fall through to local search
+        
+        # Local search (fallback or default)
+        if not self.course_vectors:
+            # Recompute if needed
+            self._precompute_course_vectors()
+        
         # Calculate similarity with all courses
         similarities = []
         for course_id, course_data in self.course_vectors.items():
-            similarity = self.cosine_similarity(query_vector, course_data['vector'])
+            similarity = self.cosine_similarity(
+                query_vector, course_data['vector']
+            )
             similarities.append((course_data['course'], similarity))
         
         # Sort by similarity (descending)
@@ -170,12 +372,8 @@ class SemanticSearch:
         Returns:
             List of (course_dict, similarity_score) tuples
         """
-        # Find the course
-        target_course = None
-        for course in self.courses:
-            if course.get('code', '').upper() == course_code.upper():
-                target_course = course
-                break
+        # Find the course (check MongoDB first if enabled)
+        target_course = self.get_course_info(course_code)
         
         if not target_course:
             logger.warning(f"Course {course_code} not found")
@@ -203,7 +401,7 @@ class SemanticSearch:
         
         return filtered_results[:top_k]
     
-    def get_course_info(self, course_code: str) -> Dict:
+    def get_course_info(self, course_code: str) -> Optional[Dict]:
         """
         Get detailed information about a specific course.
         
@@ -213,10 +411,90 @@ class SemanticSearch:
         Returns:
             Course dictionary or None if not found
         """
+        # Try MongoDB first if enabled
+        if self.use_mongodb and self.mongodb_storage:
+            try:
+                course = self.mongodb_storage.get_course(course_code)
+                if course:
+                    return course
+            except Exception as e:
+                logger.warning(f"MongoDB lookup failed: {e}, using local")
+        
+        # Fallback to local search
         for course in self.courses:
             if course.get('code', '').upper() == course_code.upper():
                 return course
         return None
+    
+    def toggle_mongodb(self, enable: bool, mongodb_uri: Optional[str] = None):
+        """
+        Toggle MongoDB usage on/off.
+        
+        Args:
+            enable: If True, enable MongoDB; if False, use local model
+            mongodb_uri: MongoDB connection string (optional)
+        """
+        if enable and not MONGODB_AVAILABLE:
+            logger.error("MongoDB not available. Install pymongo to use MongoDB.")
+            return False
+        
+        if enable:
+            try:
+                # Use provided URI or fall back to environment variable
+                uri = mongodb_uri or os.getenv('MONGODB_URI')
+                db_name = os.getenv('MONGODB_DATABASE', 'course_search')
+                coll_name = os.getenv('MONGODB_COLLECTION', 'courses')
+                
+                self.mongodb_storage = MongoDBStorage(
+                    connection_string=uri,
+                    database_name=db_name,
+                    collection_name=coll_name
+                )
+                if self.mongodb_storage.connect():
+                    self.use_mongodb = True
+                    search_method = "cosine similarity aggregation" if self.use_cosine_aggregation else "Atlas vector search"
+                    logger.info(f"Switched to MongoDB vector search ({search_method})")
+                    return True
+                else:
+                    logger.error("Failed to connect to MongoDB")
+                    return False
+            except Exception as e:
+                logger.error(f"Failed to enable MongoDB: {e}")
+                return False
+        else:
+            self.use_mongodb = False
+            if self.mongodb_storage:
+                self.mongodb_storage.disconnect()
+            # Ensure model is loaded for local search
+            try:
+                self._ensure_model_loaded()
+            except (ValueError, FileNotFoundError) as e:
+                logger.error(f"Cannot switch to local model: {e}")
+                return False
+            # Recompute local vectors if needed
+            if not self.course_vectors:
+                self._precompute_course_vectors()
+            logger.info("Switched to local model")
+            return True
+    
+    def toggle_cosine_aggregation(self, enable: bool) -> bool:
+        """
+        Toggle between Atlas vector search and MongoDB cosine similarity aggregation.
+        
+        Args:
+            enable: If True, use cosine similarity aggregation; if False, use Atlas vector search
+            
+        Returns:
+            True if toggled successfully, False otherwise
+        """
+        if not self.use_mongodb:
+            logger.warning("MongoDB must be enabled to use cosine similarity aggregation")
+            return False
+        
+        self.use_cosine_aggregation = enable
+        method = "cosine similarity aggregation" if enable else "Atlas vector search"
+        logger.info(f"Switched to {method}")
+        return True
     
     def _extract_course_from_query(self, query: str) -> Dict:
         """

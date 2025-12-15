@@ -6,5 +6,9 @@ from .scraper import CourseScraper
 from .word2vec_trainer import Word2VecTrainer
 from .semantic_search import SemanticSearch
 
-__all__ = ['CourseScraper', 'Word2VecTrainer', 'SemanticSearch']
+try:
+    from .mongodb_storage import MongoDBStorage
+    __all__ = ['CourseScraper', 'Word2VecTrainer', 'SemanticSearch', 'MongoDBStorage']
+except ImportError:
+    __all__ = ['CourseScraper', 'Word2VecTrainer', 'SemanticSearch']
 
